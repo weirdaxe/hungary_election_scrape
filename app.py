@@ -1,12 +1,10 @@
 import io
 import json
-import time
 from collections import defaultdict
 
 import pandas as pd
 import requests
 import streamlit as st
-
 
 # -------------------------------------------------------------------
 # Constants
@@ -14,14 +12,15 @@ import streamlit as st
 VER_BASE = "https://vtr.valasztas.hu/ogy2022/data/04022333/ver"
 SZAVOSSZ_BASE = "https://vtr.valasztas.hu/ogy2022/data/04161400/szavossz"
 
+
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
 
 def slugify(name: str) -> str:
     """
-    Very simple slug for column names: lowercase, replace spaces and dashes,
-    remove commas and periods.
+    Simple slug for column names: lowercase, replace spaces and dashes,
+    remove some punctuation.
     """
     if name is None:
         return "unknown"
@@ -49,7 +48,7 @@ def load_global_meta():
     telep = fetch_json(f"{VER_BASE}/Telepulesek.json")["list"]
     egyeni = fetch_json(f"{VER_BASE}/EgyeniJeloltek.json")["list"]
     listak = fetch_json(f"{VER_BASE}/ListakEsJeloltek.json")["list"]
-    # these two are not strictly needed for the core outputs but kept for completeness
+    # not strictly needed for the CSVs, but useful context
     jlcs = fetch_json(f"{VER_BASE}/Jlcs.json")["list"]
     szervezetek = fetch_json(f"{VER_BASE}/Szervezetek.json")["list"]
     return telep, egyeni, listak, jlcs, szervezetek
@@ -61,7 +60,6 @@ def build_constituency_id_mapping(egyeni_list):
       - mapping (maz, evk) -> constituency_id (same for all areas with same candidate set)
       - candidate name per party per constituency for later columns.
     """
-    # collect candidate sets per (maz, evk)
     cand_by_const = defaultdict(set)
     cand_meta_rows = []  # for candidate names per party
 
@@ -168,13 +166,12 @@ def build_df_from_all_pairs(telep, egyeni_list, listak_list, progress_placeholde
             szk_data = fetch_json(szk_url)
         except Exception:
             # missing or problem → skip this (maz, taz)
+            bar.progress(idx / total)
             continue
 
         szk_data = szk_data.get("data", szk_data)
         szk_stations = szk_data.get("szavazokorok", [])
 
-        # build map from sorszam → (evk, evk_nev etc.) for this (maz, taz)
-        szk_map = {}
         for sz in szk_stations:
             sorsz = sz["sorszam"]
             row = {
@@ -194,14 +191,12 @@ def build_df_from_all_pairs(telep, egyeni_list, listak_list, progress_placeholde
             for k, v in letszam.items():
                 row[f"letszam_{k}"] = v
             szk_rows.append(row)
-            szk_map[sorsz] = row
 
         # SzavkorJkv: results per station
         jkv_url = f"{SZAVOSSZ_BASE}/{maz}/SzavkorJkv-{maz}-{taz}.json"
         try:
             jkv_data = fetch_json(jkv_url)
         except Exception:
-            # no results for this (maz, taz)
             bar.progress(idx / total)
             continue
 
@@ -311,7 +306,6 @@ def build_df_from_all_pairs(telep, egyeni_list, listak_list, progress_placeholde
     if not df_list_wide.empty:
         dfs.append(df_list_wide)
 
-    # some (maz, taz, sorsz) may be missing in some pieces → outer join
     df_results = None
     for d in dfs:
         if df_results is None:
@@ -401,7 +395,8 @@ st.title("Hungary 2022 Parliamentary Election – Polling Station Scraper")
 st.write(
     "This app scrapes polling-station level data (all counties/municipalities) "
     "from vtr.valasztas.hu for OGY 2022 and builds two CSVs:\n"
-    "- polling_station_results.csv: station info, results by party (individual), list results, candidate names, constituency_id\n"
+    "- polling_station_results.csv: station info, results by party (individual), "
+    "list results, candidate names, constituency_id\n"
     "- polling_station_info.csv: station info, electorate, turnout, constituency_id"
 )
 
@@ -420,6 +415,43 @@ if st.button("Scrape and build CSVs"):
     )
     progress_bar.progress(1.0)
     progress_text.text("Done building dataframes.")
+
+    # ---- RAW JSON PREVIEW ----
+    st.subheader("Raw JSON preview")
+
+    # preview first Telepulesek entry
+    if telep:
+        with st.expander("Raw JSON: Telepulesek.json (first entry)"):
+            st.json(telep[0])
+
+    # choose a sample (maz, taz) and show its two JSONs
+    pairs = sorted({(row["maz"], row["taz"]) for row in telep})
+    if pairs:
+        sm_maz, sm_taz = pairs[0]
+
+        szk_url = f"{VER_BASE}/Szavazokorok-{sm_maz}-{sm_taz}.json"
+        jkv_url = f"{SZAVOSSZ_BASE}/{sm_maz}/SzavkorJkv-{sm_maz}-{sm_taz}.json"
+
+        try:
+            szk_raw = fetch_json(szk_url)
+            with st.expander(f"Raw JSON: Szavazokorok-{sm_maz}-{sm_taz}.json"):
+                st.json(szk_raw)
+        except Exception:
+            st.write(f"Could not fetch {szk_url}")
+
+        try:
+            jkv_raw = fetch_json(jkv_url)
+            with st.expander(f"Raw JSON: SzavkorJkv-{sm_maz}-{sm_taz}.json"):
+                st.json(jkv_raw)
+        except Exception:
+            st.write(f"Could not fetch {jkv_url}")
+
+    # ---- DATAFRAME PREVIEWS ----
+    st.subheader("Preview: polling_station_results (first 10 rows)")
+    st.dataframe(df_results.head(10))
+
+    st.subheader("Preview: polling_station_info (first 10 rows)")
+    st.dataframe(df_info.head(10))
 
     # 3) prepare CSVs for download
     buf_results = io.StringIO()
@@ -443,4 +475,3 @@ if st.button("Scrape and build CSVs"):
         file_name="polling_station_info.csv",
         mime="text/csv",
     )
-
