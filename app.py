@@ -17,10 +17,6 @@ SZAVOSSZ_BASE = "https://vtr.valasztas.hu/ogy2022/data/04161400/szavossz"
 # -------------------------------------------------------------------
 
 def slugify(name: str) -> str:
-    """
-    Simple slug for column names: lowercase, replace spaces and dashes,
-    remove some punctuation.
-    """
     if name is None:
         return "unknown"
     s = name.strip().lower()
@@ -34,33 +30,58 @@ def slugify(name: str) -> str:
     return s or "unknown"
 
 
-@st.cache_data(show_spinner=False)
-def fetch_json(url: str):
-    resp = requests.get(url, headers={"User-Agent": "ogy2022-streamlit-scraper"})
-    resp.raise_for_status()
-    return resp.json()
+def fetch_json_with_log(url: str, log: list):
+    """Fetch JSON, return dict or None, and append a detailed record to `log`."""
+    try:
+        resp = requests.get(url, headers={"User-Agent": "ogy2022-streamlit-scraper"})
+        status = resp.status_code
+        if status == 200:
+            try:
+                data = resp.json()
+                log.append({"url": url, "status": status, "ok": True, "error": ""})
+                return data
+            except Exception as e:
+                log.append(
+                    {
+                        "url": url,
+                        "status": status,
+                        "ok": False,
+                        "error": f"JSON decode error: {e}",
+                    }
+                )
+                return None
+        else:
+            log.append(
+                {"url": url, "status": status, "ok": False, "error": "HTTP error"}
+            )
+            return None
+    except Exception as e:
+        log.append(
+            {"url": url, "status": None, "ok": False, "error": f"Request error: {e}"}
+        )
+        return None
 
 
-@st.cache_data(show_spinner=False)
-def load_global_meta():
-    """Download and cache global metadata JSONs."""
-    telep = fetch_json(f"{VER_BASE}/Telepulesek.json")["list"]
-    egyeni = fetch_json(f"{VER_BASE}/EgyeniJeloltek.json")["list"]
-    listak = fetch_json(f"{VER_BASE}/ListakEsJeloltek.json")["list"]
-    # not strictly needed for CSVs but useful for raw preview/context
-    jlcs = fetch_json(f"{VER_BASE}/Jlcs.json")["list"]
-    szervezetek = fetch_json(f"{VER_BASE}/Szervezetek.json")["list"]
+def load_global_meta(log):
+    """Download global metadata JSONs with logging."""
+    telep_raw = fetch_json_with_log(f"{VER_BASE}/Telepulesek.json", log)
+    egyeni_raw = fetch_json_with_log(f"{VER_BASE}/EgyeniJeloltek.json", log)
+    listak_raw = fetch_json_with_log(f"{VER_BASE}/ListakEsJeloltek.json", log)
+    jlcs_raw = fetch_json_with_log(f"{VER_BASE}/Jlcs.json", log)
+    szervezetek_raw = fetch_json_with_log(f"{VER_BASE}/Szervezetek.json", log)
+
+    telep = telep_raw.get("list", []) if telep_raw else []
+    egyeni = egyeni_raw.get("list", []) if egyeni_raw else []
+    listak = listak_raw.get("list", []) if listak_raw else []
+    jlcs = jlcs_raw.get("list", []) if jlcs_raw else []
+    szervezetek = szervezetek_raw.get("list", []) if szervezetek_raw else []
+
     return telep, egyeni, listak, jlcs, szervezetek
 
 
 def build_constituency_id_mapping(egyeni_list):
-    """
-    Build:
-      - mapping (maz, evk) -> constituency_id (same for all areas with same candidate set)
-      - candidate name per party per constituency for later columns.
-    """
     cand_by_const = defaultdict(set)
-    cand_meta_rows = []  # for candidate names per party
+    cand_meta_rows = []
 
     for c in egyeni_list:
         maz = c["maz"]
@@ -82,7 +103,6 @@ def build_constituency_id_mapping(egyeni_list):
             }
         )
 
-    # map each unique candidate set to an integer constituency_id
     candidate_sets = {}
     constituency_id_by_const = {}
     next_id = 1
@@ -94,13 +114,11 @@ def build_constituency_id_mapping(egyeni_list):
             next_id += 1
         constituency_id_by_const[(maz, evk)] = candidate_sets[sig]
 
-    # build constituency dataframe
     const_rows = []
     for (maz, evk), cid in constituency_id_by_const.items():
         const_rows.append({"maz": maz, "evk": evk, "constituency_id": cid})
     df_const_ids = pd.DataFrame(const_rows)
 
-    # build candidate-name-wide table
     df_const_cands = pd.DataFrame(cand_meta_rows)
     if not df_const_cands.empty:
         df_const_cands_wide = df_const_cands.pivot_table(
@@ -108,15 +126,12 @@ def build_constituency_id_mapping(egyeni_list):
             columns="col",
             values="candidate_name",
             aggfunc="first",
-        )
-        df_const_cands_wide = df_const_cands_wide.reset_index()
+        ).reset_index()
     else:
         df_const_cands_wide = pd.DataFrame(columns=["maz", "evk"])
 
-    # merge constituency_id into candidate-name table
     df_const = df_const_ids.merge(df_const_cands_wide, on=["maz", "evk"], how="left")
-
-    return df_const  # columns: maz, evk, constituency_id, candidate_*_name...
+    return df_const
 
 
 def build_df_from_all_pairs(
@@ -125,18 +140,10 @@ def build_df_from_all_pairs(
     listak_list,
     progress_placeholder,
     bar,
+    log,
     test_mode=False,
     test_limit=50,
 ):
-    """
-    Core scraping + dataframe construction:
-      - iterates over all (maz, taz) pairs in Telepulesek
-      - fetches Szavazokorok-{maz}-{taz}.json and SzavkorJkv-{maz}-{taz}.json
-      - builds df_results and df_info (pure column merges)
-      - also returns first raw szk and jkv jsons for preview
-      - if test_mode=True, only uses first `test_limit` (maz, taz) pairs
-    """
-    # candidate metadata dict (by ej_id)
     cand_meta = {
         c["ej_id"]: {
             "jlcs_nev": c.get("jlcs_nev", "UNKNOWN"),
@@ -144,7 +151,6 @@ def build_df_from_all_pairs(
         for c in egyeni_list
     }
 
-    # list metadata dict (by tl_id)
     list_meta = {
         l["tl_id"]: {
             "jlcs_nev": l.get("jlcs_nev", "UNKNOWN"),
@@ -153,18 +159,16 @@ def build_df_from_all_pairs(
         for l in listak_list
     }
 
-    # mapping (maz, evk) -> constituency_id + candidate name columns
     df_constituencies = build_constituency_id_mapping(egyeni_list)
 
-    # unique (maz, taz) pairs
     pairs = sorted({(row["maz"], row["taz"]) for row in telep})
     if test_mode:
         pairs = pairs[:test_limit]
 
-    szk_rows = []        # polling station info
-    base_rows = []       # aggregate turnout / vp data
-    cand_party_rows = [] # individual ballot by party (per polling station)
-    list_rows = []       # list ballot by list (per polling station)
+    szk_rows = []
+    base_rows = []
+    cand_party_rows = []
+    list_rows = []
 
     sample_szk_raw = None
     sample_jkv_raw = None
@@ -177,11 +181,10 @@ def build_df_from_all_pairs(
             + (" [TEST MODE]" if test_mode else "")
         )
 
-        # Szavazokorok: polling stations + electorate
+        # Szavazokorok
         szk_url = f"{VER_BASE}/Szavazokorok-{maz}-{taz}.json"
-        try:
-            szk_data = fetch_json(szk_url)
-        except Exception:
+        szk_data = fetch_json_with_log(szk_url, log)
+        if szk_data is None:
             bar.progress(idx / total)
             continue
 
@@ -191,7 +194,6 @@ def build_df_from_all_pairs(
         szk_data_inner = szk_data.get("data", szk_data)
         szk_stations = szk_data_inner.get("szavazokorok", [])
 
-        # build quick lookup of evk for this (maz, taz, sorsz)
         evk_map = {}
 
         for sz in szk_stations:
@@ -217,11 +219,10 @@ def build_df_from_all_pairs(
                 row[f"letszam_{k}"] = v
             szk_rows.append(row)
 
-        # SzavkorJkv: results per station
+        # SzavkorJkv
         jkv_url = f"{SZAVOSSZ_BASE}/{maz}/SzavkorJkv-{maz}-{taz}.json"
-        try:
-            jkv_data = fetch_json(jkv_url)
-        except Exception:
+        jkv_data = fetch_json_with_log(jkv_url, log)
+        if jkv_data is None:
             bar.progress(idx / total)
             continue
 
@@ -241,28 +242,21 @@ def build_df_from_all_pairs(
             ej = rec["egyeni_jkv"]
             li = rec["listas_jkv"]
 
-            # base turnout / validity
             base_row = {
                 **key,
                 "vp_osszes_egyeni": ej.get("vp_osszes", 0),
-                "szavazott_osszesen_egyени": ej.get("szavazott_osszesen", 0),
-                "szavazott_osszesen_szaz_egyени": ej.get("szavazott_osszesen_szaz", 0.0),
-                "szl_ervenyes_egyени": ej.get("szl_ervenyes", 0),
-                "szl_ervenytelen_egyени": ej.get("szl_ervenytelen", 0),
+                "szavazott_osszesen_egyeni": ej.get("szavazott_osszesen", 0),
+                "szavazott_osszesen_szaz_egyeni": ej.get("szavazott_osszesen_szaz", 0.0),
+                "szl_ervenyes_egyeni": ej.get("szl_ervenyes", 0),
+                "szl_ervenytelen_egyeni": ej.get("szl_ervenytelen", 0),
                 "vp_osszes_lista": li.get("vp_osszes", 0),
                 "szavazott_osszesen_lista": li.get("szavazott_osszesen", 0),
                 "szavazott_osszesen_szaz_lista": li.get("szavazott_osszesen_szaz", 0.0),
                 "szl_ervenyes_lista": li.get("szl_ervenyes", 0),
                 "szl_ervenytelen_lista": li.get("szl_ervenytelen", 0),
             }
-            # normalize possible stray unicode
-            base_row = {
-                (k.replace("egyени", "egyeni") if isinstance(k, str) else k): v
-                for k, v in base_row.items()
-            }
             base_rows.append(base_row)
 
-            # individual ballot: aggregate by party (jlcs_nev)
             for t in ej.get("tetelek", []):
                 ej_id = t["ej_id"]
                 votes = t.get("szavazat", 0)
@@ -278,7 +272,6 @@ def build_df_from_all_pairs(
                     }
                 )
 
-            # list ballot: per list (party / minority list)
             for t in li.get("tetelek", []):
                 tl_id = t["tl_id"]
                 votes = t.get("szavazat", 0)
@@ -299,13 +292,10 @@ def build_df_from_all_pairs(
 
         bar.progress(idx / total)
 
-    # ---------------------------
-    # Build dataframes (column merges only)
-    # ---------------------------
-    df_szk = pd.DataFrame(szk_rows)    # station info + electorate
-    df_base = pd.DataFrame(base_rows)  # turnout etc.
+    # DataFrame construction
+    df_szk = pd.DataFrame(szk_rows)
+    df_base = pd.DataFrame(base_rows)
 
-    # individual ballot by party
     df_cand_long = pd.DataFrame(cand_party_rows)
     if not df_cand_long.empty:
         df_cand_wide = df_cand_long.pivot_table(
@@ -317,7 +307,6 @@ def build_df_from_all_pairs(
     else:
         df_cand_wide = pd.DataFrame()
 
-    # list ballot by list
     df_list_long = pd.DataFrame(list_rows)
     if not df_list_long.empty:
         df_list_wide = df_list_long.pivot_table(
@@ -332,26 +321,20 @@ def build_df_from_all_pairs(
     if df_szk.empty:
         return pd.DataFrame(), pd.DataFrame(), sample_szk_raw, sample_jkv_raw
 
-    # merge base turnout
     df_results = df_szk.merge(
         df_base, on=["maz", "taz", "sorsz", "evk"], how="left"
     )
 
-    # merge individual by-party votes
     if not df_cand_wide.empty:
         df_results = df_results.merge(
             df_cand_wide, on=["maz", "taz", "sorsz", "evk"], how="left"
         )
 
-    # merge list votes
     if not df_list_wide.empty:
         df_results = df_results.merge(
             df_list_wide, on=["maz", "taz", "sorsz", "evk"], how="left"
         )
 
-    # ---------------------------
-    # df_info = station info + electorate + turnout, no vote-by-party/list
-    # ---------------------------
     info_cols = [
         "maz",
         "taz",
@@ -368,24 +351,20 @@ def build_df_from_all_pairs(
     info_cols += [c for c in df_results.columns if c.startswith("letszam_")]
     info_cols += [
         "vp_osszes_egyeni",
-        "szavazott_osszesen_egyени",
-        "szavazott_osszesen_szaz_egyени",
-        "szl_ervenyes_egyени",
-        "szl_ervenytelen_egyени",
+        "szavazott_osszesen_egyeni",
+        "szavazott_osszesen_szaz_egyeni",
+        "szl_ervenyes_egyeni",
+        "szl_ervenytelen_egyeni",
         "vp_osszes_lista",
         "szavazott_osszesen_lista",
         "szavazott_osszesen_szaz_lista",
         "szl_ervenyes_lista",
         "szl_ervenytelen_lista",
     ]
-    info_cols = [c.replace("egyени", "egyeni") for c in info_cols]
     info_cols = [c for c in info_cols if c in df_results.columns]
 
     df_info = df_results[info_cols].copy()
 
-    # ---------------------------
-    # Add constituency_id and candidate name columns (per party)
-    # ---------------------------
     df_results = df_results.merge(
         df_constituencies, on=["maz", "evk"], how="left"
     )
@@ -393,9 +372,6 @@ def build_df_from_all_pairs(
         df_constituencies, on=["maz", "evk"], how="left"
     )
 
-    # ---------------------------
-    # English renaming for df_info basic columns
-    # ---------------------------
     df_info_rename_map = {
         "szk_nev": "polling_station_name",
         "evk": "constituency_code",
@@ -411,20 +387,16 @@ def build_df_from_all_pairs(
         "letszam_atjelInnen": "electorate_transferred_out",
         "letszam_osszesen": "electorate_total",
         "vp_osszes_egyeni": "eligible_voters_individual",
-        "szavazott_osszesen_egyени": "turnout_individual",
-        "szavazott_osszesen_szaz_egyени": "turnout_rate_pct_individual",
-        "szl_ervenyes_egyени": "valid_votes_individual",
-        "szl_ervenytelen_egyени": "invalid_votes_individual",
+        "szavazott_osszesen_egyeni": "turnout_individual",
+        "szavazott_osszesen_szaz_egyeni": "turnout_rate_pct_individual",
+        "szl_ervenyes_egyeni": "valid_votes_individual",
+        "szl_ervenytelen_egyeni": "invalid_votes_individual",
         "vp_osszes_lista": "eligible_voters_list",
         "szavazott_osszesen_lista": "turnout_list",
         "szavazott_osszesen_szaz_lista": "turnout_rate_pct_list",
         "szl_ervenyes_lista": "valid_votes_list",
         "szl_ervenytelen_lista": "invalid_votes_list",
     }
-    df_info_rename_map = {
-        k.replace("egyени", "egyeni"): v for k, v in df_info_rename_map.items()
-    }
-
     df_info = df_info.rename(columns=df_info_rename_map)
 
     return df_results, df_info, sample_szk_raw, sample_jkv_raw
@@ -437,8 +409,8 @@ def build_df_from_all_pairs(
 st.title("Hungary 2022 Parliamentary Election – Polling Station Scraper")
 
 st.write(
-    "This app scrapes polling-station level data (all counties/municipalities) "
-    "from vtr.valasztas.hu for OGY 2022 and builds two CSVs:\n"
+    "This app scrapes polling-station level data from vtr.valasztas.hu for OGY 2022 "
+    "and builds two CSVs:\n"
     "- polling_station_results.csv: station info, results by party (individual), "
     "list results, candidate names, constituency_id\n"
     "- polling_station_info.csv: station info, electorate, turnout, constituency_id"
@@ -450,52 +422,60 @@ if st.button("Scrape and build CSVs"):
     progress_text = st.empty()
     progress_bar = st.progress(0.0)
 
-    # 1) load global metadata
+    # HTTP log
+    http_log = []
+
+    # 1) global meta
     progress_text.text("Downloading global metadata (Telepulesek, candidates, lists)...")
-    telep, egyeni_list, listak_list, jlcs, szervezetek = load_global_meta()
+    telep, egyeni_list, listak_list, jlcs, szervezetek = load_global_meta(http_log)
     progress_bar.progress(0.05)
 
-    # 2) scrape all (maz, taz) and build dataframes + sample raw JSONs
+    # 2) main scrape
     df_results, df_info, sample_szk_raw, sample_jkv_raw = build_df_from_all_pairs(
         telep,
         egyeni_list,
         listak_list,
         progress_text,
         progress_bar,
+        log=http_log,
         test_mode=test_mode,
         test_limit=50,
     )
     progress_bar.progress(1.0)
-    progress_text.text("Done building dataframes.")
+    progress_text.text("Scraping completed.")
 
-    if df_results.empty:
-        st.error("No data could be built (df_results is empty). Check network access or URL paths.")
+    # ---- HTTP LOG PREVIEW (this is what you need to debug URL/network issues) ----
+    st.subheader("HTTP request log")
+    if http_log:
+        st.dataframe(pd.DataFrame(http_log))
     else:
-        # ---- RAW JSON PREVIEW ----
-        st.subheader("Raw JSON preview")
+        st.write("No HTTP requests recorded – something is wrong before fetching.")
 
-        # global Telepulesek preview
-        if telep:
-            with st.expander("Raw JSON: Telepulesek.json (first entry)"):
-                st.json(telep[0])
+    # ---- RAW JSON PREVIEW ----
+    st.subheader("Raw JSON preview")
 
-        # first Szavazokorok and SzavkorJkv actually processed in the scraping loop
-        if sample_szk_raw is not None:
-            with st.expander("Raw JSON: first Szavazokorok-maz-taz.json processed"):
-                st.json(sample_szk_raw)
+    if telep:
+        with st.expander("Raw JSON: Telepulesek.json (first entry)"):
+            st.json(telep[0])
 
-        if sample_jkv_raw is not None:
-            with st.expander("Raw JSON: first SzavkorJkv-maz-taz.json processed"):
-                st.json(sample_jkv_raw)
+    if sample_szk_raw is not None:
+        with st.expander("Raw JSON: first Szavazokorok-maz-taz.json processed"):
+            st.json(sample_szk_raw)
 
-        # ---- DATAFRAME PREVIEWS ----
+    if sample_jkv_raw is not None:
+        with st.expander("Raw JSON: first SzavkorJkv-maz-taz.json processed"):
+            st.json(sample_jkv_raw)
+
+    # ---- DATAFRAME PREVIEWS / DOWNLOADS ----
+    if df_results.empty:
+        st.error("df_results is empty. Check the HTTP log above for failing URLs/status codes.")
+    else:
         st.subheader("Preview: polling_station_results (first 10 rows)")
         st.dataframe(df_results.head(10))
 
         st.subheader("Preview: polling_station_info (first 10 rows)")
         st.dataframe(df_info.head(10))
 
-        # 3) prepare CSVs for download
         buf_results = io.StringIO()
         df_results.to_csv(buf_results, index=False)
         csv_results = buf_results.getvalue()
