@@ -182,7 +182,7 @@ def build_df_from_all_pairs(
         )
 
         # Szavazokorok
-        szk_url = f"{VER_BASE}/Szavazokorok-{maz}-{taz}.json"
+        szk_url = f"{VER_BASE}/{maz}/Szavazokorok-{maz}-{taz}.json"
         szk_data = fetch_json_with_log(szk_url, log)
         if szk_data is None:
             bar.progress(idx / total)
