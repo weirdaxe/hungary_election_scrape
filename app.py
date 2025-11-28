@@ -493,7 +493,7 @@ def build_df_from_all_pairs(
     }
     # df_info = df_info.rename(columns=df_info_rename_map)
     df_info = df_info.rename(columns=COLUMN_RENAME_MAP)
-    df_results = df_results.rename(columns=COLUMN_RENAME_MAP
+    df_results = df_results.rename(columns=COLUMN_RENAME_MAP)
                                    
     return df_results, df_info, sample_szk_raw, sample_jkv_raw
 
