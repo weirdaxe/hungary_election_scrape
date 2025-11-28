@@ -29,6 +29,90 @@ def slugify(name: str) -> str:
     s = s.strip("_")
     return s or "unknown"
 
+# -------------------------------------------------------------------
+# Party / list name normalisation to English
+# -------------------------------------------------------------------
+
+PARTY_NAME_MAP = {
+    "DK-JOBBIK-MOMENTUM-MSZP-LMP-PÁRBESZÉD": "United for Hungary",
+    "FIDESZ-KDNP": "Fidesz",
+    "ORÖ": "Ruthenians",
+    "BOLGÁR ORSZÁGOS ÖNKORMÁNYZAT": "Bulgarians",
+    "OHÖ": "Croatians",
+    "MAGYARORSZÁGI GÖRÖGÖK ORSZÁGOS": "Greeks",
+    "UOÖ": "Ukrainians",
+    "OÖÖ": "Armenians",
+    "MNOÖ": "Germans",
+    "OLÖ": "Poles",
+    "ORSZÁGOS SZLOVÁK ÖNK": "Slovaks",
+    "MI HAZÁNK": "Our Homeland",
+    "MKKP": "Two-Tailed Dog",
+    "MEMO": "Solution",
+    "NORMÁLIS PÁRT": "Normal Life",
+}
+
+# crude keyword fallback for other minority lists
+MINORITY_KEYWORDS = {
+    "NÉMET": "Germans",
+    "SZLOVÁK": "Slovaks",
+    "BOLGÁR": "Bulgarians",
+    "GÖRÖG": "Greeks",
+    "UKRÁN": "Ukrainians",
+    "HORVÁT": "Croatians",
+    "SZERB": "Serbs",
+    "ROMA": "Roma",
+    "SZLOVÉN": "Slovenes",
+    "LENGYEL": "Poles",
+    "ÖRMÉNY": "Armenians",
+    "UKRÁN": "Ukrainians",
+}
+COLUMN_RENAME_MAP = {
+    "szk_nev": "polling_station_name",
+    "evk": "constituency_code",
+    "evk_nev": "constituency_name",
+    "cim": "polling_station_address",
+
+    "akadaly": "accessible_for_disabled",          # 1 = accessible
+    "szamlKijelolt": "designated_counting_station",# 1 = counting station
+    "atjKijelolt": "designated_transfer_station",  # 1 = handles transferred voters
+    "telepSzintu": "municipality_level_station",   # 1 = single station for whole municipality
+
+    "letszam_indulo": "electorate_initial",        # starting register size
+    "letszam_honos": "electorate_resident",        # resident voters
+    "letszam_atjel": "electorate_transferred_in",  # voters voting here from elsewhere
+    "letszam_atjelInnen": "electorate_transferred_out", # voters from here voting elsewhere
+    "letszam_osszesen": "electorate_total",        # total eligible at station
+
+    "vp_osszes_egyeni": "eligible_voters_individual",
+    "szavazott_osszesen_egyeni": "turnout_individual",
+    "szavazott_osszesen_szaz_egyeni": "turnout_rate_pct_individual",
+    "szl_ervenyes_egyeni": "valid_votes_individual",
+    "szl_ervenytelen_egyeni": "invalid_votes_individual",
+
+    "vp_osszes_lista": "eligible_voters_list",
+    "szavazott_osszesen_lista": "turnout_list",
+    "szavazott_osszesen_szaz_lista": "turnout_rate_pct_list",
+    "szl_ervenyes_lista": "valid_votes_list",
+    "szl_ervenytelen_lista": "invalid_votes_list",
+}
+
+def canonical_party_name(raw: str) -> str:
+    """Map Hungarian party/list names to short English labels where possible."""
+    if not raw:
+        return "Unknown"
+    key = raw.strip().upper()
+
+    # direct mapping first
+    if key in PARTY_NAME_MAP:
+        return PARTY_NAME_MAP[key]
+
+    # keyword-based minority guess
+    for kw, eng in MINORITY_KEYWORDS.items():
+        if kw in key:
+            return eng
+
+    # fallback: title-case original
+    return raw.title()
 
 def fetch_json_with_log(url: str, log: list):
     """Fetch JSON, return dict or None, and append a detailed record to `log`."""
@@ -89,10 +173,14 @@ def build_constituency_id_mapping(egyeni_list):
         ej_id = c["ej_id"]
         jlcs_nev = c.get("jlcs_nev", "UNKNOWN")
         name = c.get("neve", "")
+
         cand_by_const[(maz, evk)].add(ej_id)
 
-        party_slug = slugify(jlcs_nev)
+        # use canonical English party/list name for columns
+        canon_name = canonical_party_name(jlcs_nev)
+        party_slug = slugify(canon_name)
         colname = f"candidate_{party_slug}_name"
+
         cand_meta_rows.append(
             {
                 "maz": maz,
@@ -262,8 +350,11 @@ def build_df_from_all_pairs(
                 votes = t.get("szavazat", 0)
                 meta = cand_meta.get(ej_id, {})
                 jlcs_nev = meta.get("jlcs_nev", "UNKNOWN")
-                party_slug = slugify(jlcs_nev)
+            
+                canon_name = canonical_party_name(jlcs_nev)
+                party_slug = slugify(canon_name)
                 party_col = f"votes_individual_party_{party_slug}"
+            
                 cand_party_rows.append(
                     {
                         **key,
@@ -280,8 +371,11 @@ def build_df_from_all_pairs(
                 lista_tip = meta.get("lista_tip", "X")
                 type_map = {"K": "comp", "O": "party", "N": "minority"}
                 list_type = type_map.get(lista_tip, lista_tip.lower())
-                list_slug = slugify(jlcs_nev)
+            
+                canon_name = canonical_party_name(jlcs_nev)
+                list_slug = slugify(canon_name)
                 list_col = f"votes_list_{list_type}_{list_slug}"
+            
                 list_rows.append(
                     {
                         **key,
@@ -397,8 +491,10 @@ def build_df_from_all_pairs(
         "szl_ervenyes_lista": "valid_votes_list",
         "szl_ervenytelen_lista": "invalid_votes_list",
     }
-    df_info = df_info.rename(columns=df_info_rename_map)
-
+    # df_info = df_info.rename(columns=df_info_rename_map)
+    df_info = df_info.rename(columns=COLUMN_RENAME_MAP)
+    df_results = df_results.rename(columns=COLUMN_RENAME_MAP
+                                   
     return df_results, df_info, sample_szk_raw, sample_jkv_raw
 
 
